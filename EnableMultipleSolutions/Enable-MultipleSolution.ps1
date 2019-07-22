@@ -309,7 +309,6 @@ try
         Write-Error -Message "No VMs to onboard found." -ErrorAction
     }
 
-
     # Wait for jobs to complete, stop, fail, or suspend (final states allowed for a runbook)
     $JobsResults = @()
     foreach ($RunningJob in $Jobs.GetEnumerator())
