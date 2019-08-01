@@ -72,6 +72,11 @@ Param (
     [String]
     $SolutionType
 )
+
+function IsJobTerminalState([string] $status) {
+    return $status -eq "Completed" -or $status -eq "Failed" -or $status -eq "Stopped" -or $status -eq "Suspended"
+}
+
 try
 {
     $RunbookName = "Enable-MultipleSolution"
@@ -201,7 +206,7 @@ try
         $LocalFolder = Join-Path $Env:SystemDrive (New-Guid).Guid
         New-Item -ItemType directory $LocalFolder -Force | Write-Verbose
 
-        (New-Object System.Net.WebClient).DownloadFile("https://raw.githubusercontent.com/azureautomation/runbooks/master/Utility/ARM/Enable-AutomationSolution.ps1", "$LocalFolder\Enable-AutomationSolution.ps1")
+        (New-Object System.Net.WebClient).DownloadFile("https://raw.githubusercontent.com/mortenlerudjordet/runbooks/master/Utility/ARM/Enable-AutomationSolution.ps1", "$LocalFolder\Enable-AutomationSolution.ps1")
         Unblock-File $LocalFolder\Enable-AutomationSolution.ps1 | Write-Verbose
         Import-AzureRmAutomationRunbook -ResourceGroupName $AutomationResourceGroup `
             -AutomationAccountName $AutomationAccount -Path $LocalFolder\Enable-AutomationSolution.ps1 `
@@ -261,8 +266,10 @@ try
         }
     }
 
+    $maxTimeout = 3600 # 1 hour max.
+    $pollingSeconds = 5
+    
     # Process the list of VMs using the automation service and collect jobs used
-    $Jobs = @{}
     if ($Null -ne $VMList)
     {
         foreach ($VM in $VMList)
@@ -274,104 +281,25 @@ try
             $RunbookNameParams.Add("VMName", $VM.Name)
             $RunbookNameParams.Add("SolutionType", $SolutionType)
             $RunbookNameParams.Add("UpdateScopeQuery", $True)
-
-            # Loop here until a job was successfully submitted. Will stay in the loop until job has been submitted or an exception other than max allowed jobs is reached
-            while ($true)
-            {
-                try
-                {
-                    $Job = Start-AzureRmAutomationRunbook -ResourceGroupName $AutomationResourceGroup -AutomationAccountName $AutomationAccount `
-                        -Name $DependencyRunbookName -Parameters $RunbookNameParams `
-                        -AzureRmContext $SubscriptionContext -ErrorAction Stop
-                    $Jobs.Add($VM.VMId, $Job)
-                    # Submitted job successfully, exiting while loop
-                    Write-Output "Added VM id: $($VM.VMId), VM Name: $($VM.NAME) to AA job"
-                    break
-                }
-                catch
-                {
-                    # If we have reached the max allowed jobs, sleep backoff seconds and try again inside the while loop
-                    if ($_.Exception.Message -match "conflict")
-                    {
-                        Write-Verbose -Message ("Sleeping for 30 seconds as max allowed jobs has been reached. Will try again afterwards")
-                        Start-Sleep 60
-                    }
-                    else
-                    {
-                        throw $_
-                    }
-                }
+ 
+            $job = Start-AzureRmAutomationRunbook -ResourceGroupName $AutomationResourceGroup -AutomationAccountName $AutomationAccount `
+                -Name $DependencyRunbookName -Parameters $RunbookNameParams `
+                -AzureRmContext $SubscriptionContext -ErrorAction Stop
+            # $job = Start-AzureRmAutomationRunbook -AutomationAccountName $automationAccountName -Name $runbookName -ResourceGroupName $resourceGroupName
+            $waitTime = 0
+            while((IsJobTerminalState $job.Status) -eq $false -and $waitTime -lt $maxTimeout) {
+                Start-Sleep -Seconds $pollingSeconds
+                $waitTime += $pollingSeconds
+                $job = $job | Get-AzureRmAutomationJob
             }
+            # $jobResults | Get-AzureRmAutomationJobOutput | Get-AzureRmAutomationJobOutputRecord | Select-Object -ExpandProperty Value
+            
+            Write-Output -InputObject "VM: $($VM.Name), Exec time: $waitTime, Status: $($job.Status)"
         }
     }
     else
     {
         Write-Error -Message "No VMs to onboard found." -ErrorAction
-    }
-
-    # Wait for jobs to complete, stop, fail, or suspend (final states allowed for a runbook)
-    $JobsResults = @()
-    foreach ($RunningJob in $Jobs.GetEnumerator())
-    {
-        $ActiveJob = Get-AzureRMAutomationJob -ResourceGroupName $AutomationResourceGroup `
-            -AutomationAccountName $AutomationAccount -Id $RunningJob.Value.JobId `
-            -AzureRmContext $SubscriptionContext
-        while ($ActiveJob.Status -ne "Completed" -and $ActiveJob.Status -ne "Failed" -and $ActiveJob.Status -ne "Suspended" -and $ActiveJob.Status -ne "Stopped")
-        {
-            Start-Sleep 30
-            $ActiveJob = Get-AzureRMAutomationJob -ResourceGroupName $AutomationResourceGroup `
-                -AutomationAccountName $AutomationAccount -Id $RunningJob.Value.JobId `
-                -AzureRmContext $SubscriptionContext
-        }
-        if ($ActiveJob.Status -eq "Completed")
-        {
-            Write-Output "Onboarded VM: $($VM.Name), successfully"
-        }
-        $JobsResults += $ActiveJob
-    }
-
-    # Print out results of the automation jobs
-    $JobFailed = $False
-    foreach ($JobsResult in $JobsResults)
-    {
-        $OutputJob = Get-AzureRmAutomationJobOutput  -ResourceGroupName $AutomationResourceGroup `
-            -AutomationAccountName $AutomationAccount -Id `
-            $JobsResult.JobId -AzureRmContext $SubscriptionContext -Stream Output
-        foreach ($Stream in $OutputJob)
-        {
-            (Get-AzureRmAutomationJobOutputRecord  -ResourceGroupName $AutomationResourceGroup `
-                    -AutomationAccountName $AutomationAccount -JobID $JobsResult.JobId `
-                    -AzureRmContext $SubscriptionContext -Id $Stream.StreamRecordId).Value
-        }
-
-        $ErrorJob = Get-AzureRmAutomationJobOutput  -ResourceGroupName $AutomationResourceGroup `
-            -AutomationAccountName $AutomationAccount -Id `
-            $JobsResult.JobId -AzureRmContext $SubscriptionContext -Stream Error
-        foreach ($Stream in $ErrorJob)
-        {
-            (Get-AzureRmAutomationJobOutputRecord  -ResourceGroupName $AutomationResourceGroup `
-                    -AutomationAccountName $AutomationAccount -JobID $JobsResult.JobId `
-                    -AzureRmContext $SubscriptionContext -Id $Stream.StreamRecordId).Value
-        }
-
-        $WarningJob = Get-AzureRmAutomationJobOutput  -ResourceGroupName $AutomationResourceGroup `
-            -AutomationAccountName $AutomationAccount -Id `
-            $JobsResult.JobId -AzureRmContext $SubscriptionContext -Stream Warning
-        foreach ($Stream in $WarningJob)
-        {
-            (Get-AzureRmAutomationJobOutputRecord  -ResourceGroupName $AutomationResourceGroup `
-                    -AutomationAccountName $AutomationAccount -JobID $JobsResult.JobId `
-                    -AzureRmContext $SubscriptionContext -Id $Stream.StreamRecordId).Value
-        }
-
-        if ($JobsResult.Status -ne "Completed")
-        {
-            $JobFailed = $True
-        }
-    }
-    if ($JobFailed)
-    {
-        Write-Error -Message "Some jobs failed to complete successfully. Please see output stream for details." -ErrorAction Stop
     }
 }
 catch
