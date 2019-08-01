@@ -294,7 +294,7 @@ try
             }
             # $jobResults | Get-AzureRmAutomationJobOutput | Get-AzureRmAutomationJobOutputRecord | Select-Object -ExpandProperty Value
             
-            Write-Output -InputObject "VM: $($VM.Name), Exec time: $waitTime, Status: $($job.Status)"
+            Write-Output -InputObject "VM: $($VM.Name), Exec time: $waitTime seconds, Status: $($job.Status)"
         }
     }
     else
